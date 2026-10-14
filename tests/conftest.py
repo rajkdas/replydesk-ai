@@ -46,4 +46,6 @@ def settings(tmp_path):
         smtp_user="support@example.com",
         db_path=str(tmp_path / "test.db"),
         products_file=str(Path(__file__).parent.parent / "products.example.yaml"),
+        post_check_enabled=True,
+        max_replies_per_sender=3,
     )

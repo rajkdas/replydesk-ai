@@ -259,13 +259,15 @@ async def test_pipeline_threading_headers(settings):
 @pytest.mark.asyncio
 async def test_pipeline_rate_limit_caps_per_sender(settings):
     """A sender already at the cap gets a draft, not a send."""
-    # Pre-populate store with cap hits.
     from replydesk.store import Store
+
     s = Store(settings.db_path)
     await s.connect()
-    for _ in range(settings.max_replies_per_sender):
-        await s.mark_sent("<fake@example.com>", "alice@example.com")
-    await s.close()
+    try:
+        for i in range(settings.max_replies_per_sender):
+            await s.mark_sent(f"<cap-{i}@example.com>", "alice@example.com")
+    finally:
+        await s.close()
 
     pipe = _build_pipeline(settings)
     emails = _load_emails(["plain_complaint.eml"], settings)
@@ -280,19 +282,18 @@ async def test_pipeline_crash_recovery_no_double_send(settings, monkeypatch):
     rather than re-sent."""
     from replydesk.store import Store
 
-    # Simulate a crash mid-send: write a row in 'sending' state.
+    # Open a dedicated store connection, simulate a mid-send crash, and close it
     s = Store(settings.db_path)
     await s.connect()
-    await s.record("<alice-001@example.com>", "sending")
-    await s.close()
+    try:
+        await s.record("<alice-001@example.com>", "sending")
+    finally:
+        await s.close()
 
-    # On pipeline startup, reclaim_sending moves it to 'review'.
+    # Run pipeline restart recovery
     pipe = _build_pipeline(settings)
     async with pipe:
-        # Processing the same mail again should NOT duplicate; store.already_processed
-        # returns True (the row still exists with outcome='review').
         emails = _load_emails(["plain_complaint.eml"], settings)
         results = await asyncio.gather(*[pipe.process_one(em) for em in emails])
 
-    # Either: skip because 'review' counts as already_processed.
     assert results[0].decision in {"ignore", "draft"}

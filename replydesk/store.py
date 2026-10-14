@@ -65,6 +65,8 @@ class Store:
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
         self._db = await aiosqlite.connect(self.path)
         self._db.row_factory = aiosqlite.Row
+        await self._db.execute("PRAGMA journal_mode=WAL;")
+        await self._db.execute("PRAGMA busy_timeout=5000;")
         await self._db.executescript(_SCHEMA)
         await self._db.commit()
 
