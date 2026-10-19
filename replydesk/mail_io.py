@@ -1,0 +1,589 @@
+"""Mail I/O: fetch (IMAP), parse/clean, send (SMTP), draft (IMAP APPEND).
+
+All network ops are async. Parsing/cleaning uses stdlib ``email`` plus
+``beautifulsoup4`` for HTML-to-text fallback. Quote/signature stripping is
+intentionally conservative — we'd rather keep a line too many than lose a
+customer's actual question.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import email
+import email.utils
+import logging
+import re
+from collections.abc import AsyncIterator, Iterable
+from email.message import Message
+from email.mime.text import MIMEText
+from email.policy import default as default_policy
+from typing import Any
+
+import aioimaplib
+import aiosmtplib
+from bs4 import BeautifulSoup
+
+from .config import Settings
+from .models import EmailMessage
+
+log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Parsing / cleaning
+# ---------------------------------------------------------------------------
+
+# Patterns that mark the start of a quoted reply block from common clients.
+_QUOTE_PATTERNS = [
+    re.compile(r"^\s*On .+ wrote:\s*$", re.IGNORECASE),
+    re.compile(r"^\s*-{2,}\s*Original Message\s*-{2,}\s*$", re.IGNORECASE),
+    re.compile(r"^\s*From:\s.+$"),  # Outlook header block
+    re.compile(r"^>+"),  # "> " quoted lines
+    re.compile(r"^\s*Am .+ schrieb.+:?\s*$", re.IGNORECASE),  # de
+    re.compile(r"^\s*El .+ escribi[oó]:?\s*$", re.IGNORECASE),  # es
+    re.compile(r"^\s*Le .+ a [ée]crit\s*:?\s*$", re.IGNORECASE),  # fr
+]
+
+# Common signature markers; cut the rest of the body when we hit one.
+_SIGNATURE_MARKERS = [
+    re.compile(r"^\s*--\s*$"),
+    re.compile(r"^\s*__+\s*$"),
+    re.compile(r"^\s*Regards,?\s*$", re.IGNORECASE),
+    re.compile(r"^\s*Best regards,?\s*$", re.IGNORECASE),
+    re.compile(r"^\s*Best,?\s*$", re.IGNORECASE),
+    re.compile(r"^\s*Thanks & regards", re.IGNORECASE),
+    re.compile(r"^\s*Sent from my iPhone", re.IGNORECASE),
+    re.compile(r"^\s*Sent from my Galaxy", re.IGNORECASE),
+]
+
+_NOREPLY_LOCALPARTS = {
+    "noreply", "no-reply", "no.reply", "do-not-reply", "donotreply",
+    "mailer-daemon", "mailerdaemon", "postmaster", "auto-reply",
+    "autoreply", "bounce", "bounces", "notification",
+}
+
+_AUTOMATED_HEADERS = ("auto-submitted", "precedence", "list-unsubscribe",
+                      "x-auto-response-suppress")
+
+
+def _is_automated(msg: Message, own_addr: str) -> tuple[bool, str]:
+    """Return (skip?, reason) for auto-replies / mailing lists / DSNs."""
+    own_addr = (own_addr or "").lower()
+
+    from_addr = (email.utils.parseaddr(msg.get("From", ""))[1] or "").lower()
+    if own_addr and from_addr == own_addr:
+        return True, "from_self"
+
+    auto_submitted = (msg.get("Auto-Submitted") or "").lower()
+    if auto_submitted and auto_submitted != "no":
+        return True, f"auto_submitted={auto_submitted}"
+
+    precedence = (msg.get("Precedence") or "").lower()
+    if precedence in {"bulk", "list", "junk"}:
+        return True, f"precedence={precedence}"
+
+    if msg.get("List-Unsubscribe") is not None:
+        return True, "mailing_list"
+
+    if msg.get("X-Failed-Recipients") is not None:
+        return True, "bounce"
+
+    # Content-Type: report/disposition-notification etc.
+    ct = (msg.get_content_type() or "")
+    if ct.startswith("multipart/report") or "delivery-status" in ct:
+        return True, "dsv_report"
+
+    local = from_addr.split("@", 1)[0]
+    if local in _NOREPLY_LOCALPARTS:
+        return True, "noreply_sender"
+
+    return False, ""
+
+
+def _strip_quotes_and_signatures(text: str) -> str:
+    """Drop quoted replies and trailing signature blocks from plain text."""
+    out_lines: list[str] = []
+    for line in text.splitlines():
+        if any(p.match(line) for p in _QUOTE_PATTERNS):
+            break
+        if any(p.match(line) for p in _SIGNATURE_MARKERS):
+            break
+        out_lines.append(line)
+    return "\n".join(out_lines).strip()
+
+
+def _html_to_text(html: str) -> str:
+    soup = BeautifulSoup(html, "html.parser")
+    for br in soup.find_all("br"):
+        br.replace_with("\n")
+    for blk in soup.find_all(["p", "div", "li"]):
+        blk.append("\n")
+    text = soup.get_text(separator=" ", strip=False)
+    # Collapse runs of spaces but keep newlines.
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _best_text_part(msg: Message) -> str:
+    """Pick the plain text body, falling back to HTML→text."""
+    plain = None
+    html = None
+    if msg.is_multipart():
+        for part in msg.walk():
+            ctype = part.get_content_type()
+            disp = (part.get("Content-Disposition") or "").lower()
+            if "attachment" in disp:
+                continue
+            if ctype == "text/plain" and plain is None:
+                plain = _decode_part(part)
+            elif ctype == "text/html" and html is None:
+                html = _decode_part(part)
+    else:
+        ctype = msg.get_content_type()
+        if ctype == "text/plain":
+            plain = _decode_part(msg)
+        elif ctype == "text/html":
+            html = _decode_part(msg)
+
+    if plain and plain.strip():
+        return plain
+    if html:
+        return _html_to_text(html)
+    return ""
+
+
+def _decode_part(part: Message) -> str:
+    payload = part.get_payload(decode=True)
+    if payload is None:
+        return ""
+    charset = part.get_content_charset() or "utf-8"
+    try:
+        return payload.decode(charset, errors="replace")
+    except (LookupError, TypeError):
+        return payload.decode("utf-8", errors="replace")
+
+
+def parse_email_bytes(raw: bytes, settings: Settings) -> EmailMessage:
+    """Parse raw email bytes into a cleaned :class:`EmailMessage`."""
+    msg = email.message_from_bytes(raw, policy=default_policy)
+
+    own_addr = (settings.imap_user or "").lower()
+    is_automated, skip_reason = _is_automated(msg, own_addr)
+
+    from_name, from_addr = email.utils.parseaddr(msg.get("From", ""))
+    to_name, to_addr = email.utils.parseaddr(msg.get("To", ""))
+    subject = msg.get("Subject", "") or ""
+    message_id = msg.get("Message-ID", "").strip()
+    if not message_id:
+        # Fall back to a synthetic id so dedupe still works.
+        message_id = f"synthetic:{hash(raw) & 0xFFFFFFFF:x}@replydesk.local"
+
+    date_hdr = msg.get("Date")
+    date_dt = email.utils.parsedate_to_datetime(date_hdr) if date_hdr else None
+
+    body = _best_text_part(msg)
+    body = _strip_quotes_and_signatures(body)
+    if len(body) > settings.max_body_chars:
+        body = body[: settings.max_body_chars] + "\n…[truncated]"
+
+
+    raw_headers = {
+        k: v
+        for k, v in msg.items()
+        if k.lower() in _AUTOMATED_HEADERS
+        or k.lower() in {"message-id", "references", "in-reply-to",
+                         "thread-topic", "thread-index"}
+    }
+
+    return EmailMessage(
+        message_id=message_id,
+        subject=subject,
+        from_addr=from_addr,
+        from_name=from_name or None,
+        to_addr=to_addr,
+        date=date_dt,
+        body_plain=body,
+        raw_headers=raw_headers,
+        is_automated=is_automated,
+        from_self=bool(own_addr and from_addr.lower() == own_addr),
+    )
+
+
+# ---------------------------------------------------------------------------
+# IMAP fetch
+# ---------------------------------------------------------------------------
+
+async def _connect_imap(settings: Settings) -> aioimaplib.IMAP4_SSL:
+    """Connect + login + select INBOX. Raises on failure.
+
+    ``timeout`` is aioimaplib's *per-command* timeout (default 10s). Gmail
+    logins over slow/IPv6 links can exceed that, so we raise it to 60s.
+    NOTE: aioimaplib passes this straight into ``asyncio.wait_for``, which
+    requires ``float`` - an ``int`` raises TypeError there, hence ``60.0``.
+    """
+    client = aioimaplib.IMAP4_SSL(
+        host=settings.imap_host,
+        port=settings.imap_port,
+        timeout=60.0,
+    )
+    await client.wait_hello_from_server()
+    await client.login(settings.imap_user, settings.imap_password)
+    await client.select(settings.imap_mailbox)
+    return client
+
+
+async def fetch_unseen(settings: Settings) -> AsyncIterator[EmailMessage]:
+    """Yield each unseen email, marking them as seen only after the caller
+    is done with them (the caller must call :func:`mark_seen`).
+
+    IMPORTANT: all IMAP commands here are UID-based (``UID SEARCH`` /
+    ``UID FETCH`` / ``UID STORE``). Plain ``SEARCH``/``FETCH`` return and
+    interpret *sequence numbers*, while ``STORE`` in :func:`mark_seen` uses
+    UIDs - mixing the two flags the wrong messages and makes dedupe/UID
+    bookkeeping unreliable.
+    """
+    client = await _connect_imap(settings)
+    try:
+        # Search for UNSEEN, fetch bodies without marking as seen (PEEK).
+        # BODY.PEEK[] never sets \Seen, so emails stay UNSEEN until the
+        # pipeline finishes and explicitly calls mark_seen().
+        #
+        # NOTE: aioimaplib's uid() helper only supports FETCH/STORE/COPY/MOVE/
+        # EXPUNGE - calling uid("SEARCH", ...) raises Abort. Use the dedicated
+        # uid_search() API instead, which sends a real "UID SEARCH". The
+        # results are UIDs (safe across re-syncs), unlike plain
+        # sequence-number SEARCH.
+        response = await client.uid_search("UNSEEN")
+        # aioimaplib's ``Response`` is a namedtuple with fields
+        # ``result`` ("OK"/"NO"/"BAD") and ``lines`` (untagged + tagged
+        # response byte-strings). It has NO ``status`` or ``data``
+        # attributes - reading those raises AttributeError. Verified against
+        # aioimaplib 2.0.1: Response._fields == ('result', 'lines').
+        typ, data = response.result, response.lines
+        if typ != "OK":
+            log.warning("IMAP UID SEARCH UNSEEN failed: %s", typ)
+            return
+        uids = _parse_uid_list(data)
+        log.info("found %d unseen message(s) in %r", len(uids), settings.imap_mailbox)
+
+        # Process NEWEST FIRST: IMAP UIDs increase monotonically within a
+        # mailbox (UIDVALIDITY is stable for Gmail INBOX), so sorting by
+        # descending UID gives us the most recent messages at the front.
+        # This matters especially with MAX_EMAILS - you want the cap to
+        # apply to fresh mail, not years-old backlog like UID 20404.
+        uids.sort(key=lambda u: int(u), reverse=True)
+
+        # Testing cap: process at most ``max_emails`` per run (0 = all).
+        if settings.max_emails and len(uids) > settings.max_emails:
+            log.info(
+                "limiting this run to the newest %d of %d unseen message(s) "
+                "(MAX_EMAILS=%d); the rest stay UNSEEN for the next run",
+                settings.max_emails, len(uids), settings.max_emails,
+            )
+            uids = uids[: settings.max_emails]
+        for uid in uids:
+            # aioimaplib has no ``uid_fetch()`` method; the generic ``uid()``
+            # dispatcher supports FETCH/STORE/COPY/MOVE/EXPUNGE and returns
+            # the same Response namedtuple as every other command.
+            fetch = await client.uid("FETCH", uid, "(BODY.PEEK[])")
+            typ, msg_data = fetch.result, fetch.lines
+            if typ != "OK":
+                log.warning("IMAP UID FETCH failed uid=%s: %s", uid, typ)
+                continue
+
+            raw = _extract_body_bytes(msg_data)
+            if raw is None:
+                log.warning("no body bytes in FETCH response uid=%s", uid)
+                continue
+            try:
+                em = parse_email_bytes(raw, settings)
+                em.raw_headers["x-imap-uid"] = uid
+                yield em
+            except Exception as exc:  # pragma: no cover - defensive
+                log.warning("Failed to parse UID=%s: %s", uid, exc)
+    finally:
+        with contextlib.suppress(Exception):
+            await client.logout()
+
+
+async def mark_seen(settings: Settings, uid: str) -> None:
+    """Mark a single message as seen by UID."""
+    client = await _connect_imap(settings)
+    try:
+        await client.uid("STORE", uid, "+FLAGS.SILENT", r"\Seen")
+    finally:
+        with contextlib.suppress(Exception):
+            await client.logout()
+
+
+async def append_draft(settings: Settings, reply_email: Message) -> None:
+    """Append a draft reply to the IMAP Drafts folder.
+
+    aioimaplib's real signature is
+    ``append(message_bytes: bytes, mailbox: str = 'INBOX', flags: str = None,
+    date: Any = None)`` - message bytes FIRST, and ``flags`` is a plain
+    string that gets wrapped in parentheses (a list would be mangled into
+    ``"('\\Draft')"``). Passing ``("Drafts", raw, ...)`` raised
+    AttributeError/protocol errors at runtime.
+    """
+    client = await _connect_imap(settings)
+    try:
+        raw = reply_email.as_bytes()
+        resp = await client.append(raw, "Drafts", flags=r"\Draft")
+        if resp.result != "OK":
+            raise RuntimeError(f"IMAP APPEND to Drafts failed: {resp.result}")
+    finally:
+        with contextlib.suppress(Exception):
+            await client.logout()
+
+
+def _parse_uid_list(data: list) -> list[str]:
+    """Extract UID numbers from an untagged SEARCH/ESEARCH response line.
+
+    Handles both classic ``b"SEARCH 101 102"`` and ESEARCH
+    ``b"ESEARCH (UIDS 5:7 20)"`` formats, expanding colon ranges.
+    """
+    import re
+
+    for item in data:
+        if isinstance(item, bytes):
+            txt = item.decode("ascii", errors="ignore").strip()
+            if not txt:
+                continue
+            uids: list[str] = []
+            for token in txt.split():
+                bare = token.strip("()")
+                m = re.fullmatch(r"(\d+):(?:(\d+))?", bare)
+                if m:
+                    start = int(m.group(1))
+                    end = int(m.group(2)) if m.group(2) else start
+                    uids.extend(str(u) for u in range(start, end + 1))
+                elif bare.isdigit():
+                    uids.append(bare)
+            if uids:
+                return uids
+    return []
+
+
+_FETCH_ANCHOR_RE = re.compile(
+    rb"(?<![0-9])[0-9]+ FETCH \(.*?\{([0-9]+)\}", re.IGNORECASE
+)
+_TAGGED_STATUS_RE = re.compile(rb"^[A-Za-z]{4}[0-9]{1,4} (OK|NO|BAD)")
+
+
+def _join_fetch_lines(resp_lines: list) -> bytes | None:
+    """Re-assemble the raw RFC822 bytes from aioimaplib's FETCH response.
+
+    Verified against the aioimaplib source (``Command``, ``FetchCommand``,
+    ``IMAP4ClientProtocol._handle_responses`` / ``_response_done``):
+
+    * ``Response.lines`` holds one entry per piece of the response. The
+      literal body arrives as ONE whole entry, but it is stored as a
+      ``bytearray`` (``append_literal_data`` appends ``_resp_literal_data``
+      directly), so we must accept both ``bytes`` and ``bytearray`` -
+      filtering on ``isinstance(item, bytes)`` alone silently drops the
+      entire message body.
+    * Gmail's ``UID FETCH n (BODY.PEEK[])`` produces::
+
+          [b'* 3499 FETCH (UID 23913 BODY[] {7303}',      # untagged marker
+           bytearray(b'<full 7303-byte RFC822 message>'), # the literal
+           b')',                                          # closing FETCH paren
+           b'Success']                                   # tagged text AFTER
+                                                          # the command tag
+
+    * ``_response_done`` appends only the text after the tag, so joining all
+      byte-ish entries reconstructs the server octets except that single
+      tag - harmless, because we anchor on the ``{size}`` marker and take
+      exactly ``size`` bytes from there (the trailing ``)``/status text sit
+      outside the slice).
+    """
+    blobs = [bytes(item) for item in resp_lines
+             if isinstance(item, (bytes, bytearray))]
+    if not blobs:
+        return None
+
+    joined = b"".join(blobs)
+
+    # --- Primary: anchored literal-size extraction --------------------------
+    # Lookbehind prevents matching "NNN FETCH (" inside the message itself.
+    markers = list(_FETCH_ANCHOR_RE.finditer(joined))
+    if markers:
+        m = markers[-1]
+        size = int(m.group(1))
+        tail = joined[m.end():]
+        # Sanity: a real message literal starts with an RFC822 header and
+        # has a blank line before the body. Require both before trusting
+        # the slice, so an unexpected shape falls through to heuristics.
+        blank = tail.find(b"\r\n\r\n")
+        if blank == -1:
+            blank = tail.find(b"\n\n")
+        if len(tail) >= size and blank != -1 and b":" in tail[:max(blank, 1)]:
+            return tail[:size]
+
+    # --- Fallback 1: the literal stored as its own whole entry --------------
+    literal_sizes = [int(mm.group(1)) for mm in markers]
+    for item in blobs:
+        if _TAGGED_STATUS_RE.match(item) or _FETCH_ANCHOR_RE.search(item):
+            continue
+        looks_like_mail = (
+            re.match(rb"^[A-Za-z][A-Za-z0-9_-]*:", item) is not None
+            and (b"\r\n\r\n" in item or b"\n\n" in item)
+        )
+        if not looks_like_mail:
+            continue
+        if literal_sizes and len(item.rstrip(b"\r\n")) < max(literal_sizes):
+            continue  # partial fragment - keep looking
+        return item
+
+
+    # --- Fallback 2: legacy imaplib-style (meta, body) tuples ---------------
+    for item in resp_lines:
+        if (
+            isinstance(item, tuple)
+            and len(item) == 2
+            and isinstance(item[1], (bytes, bytearray))
+            and len(item[1]) > 50
+        ):
+            return bytes(item[1])
+
+    # --- Fallback 3: largest non-status blob (never silently skip) ---------
+    candidates = [item for item in blobs
+                  if len(item) > 50
+                  and not _TAGGED_STATUS_RE.match(item)
+                  and not _FETCH_ANCHOR_RE.search(item)]
+    if candidates:
+        return max(candidates, key=len)
+    return None
+
+
+def _extract_body_bytes(resp_lines: list) -> bytes | None:
+    """Pull the raw RFC822 bytes out of a UID FETCH response.
+
+    NOTE: do NOT rstrip the result - the declared literal size is exact,
+    and trimming trailing CRLF would corrupt quoted-printable soft line
+    breaks (``...now=\r\n.\r\n``) inside the message body.
+    """
+    return _join_fetch_lines(resp_lines)
+
+
+# ---------------------------------------------------------------------------
+# SMTP send
+# ---------------------------------------------------------------------------
+
+def build_reply_message(
+    *,
+    original: EmailMessage,
+    reply_subject: str,
+    reply_body: str,
+    from_addr: str,
+) -> Message:
+    """Build an outbound email with correct threading headers.
+
+    Universal threading fix (works for Gmail, Outlook, Yahoo, iCloud and
+    custom-domain mail - all of them honour RFC 5322 threading):
+
+    1. Subject MUST match the original after Re:/Fwd: normalization. Gmail
+       falls back to subject-only grouping; any extra "Re: Re:" breaks it.
+    2. References = original's full References chain + its Message-ID, so
+       every client can reconstruct the whole conversation, not just the
+       last hop.
+    3. In-Reply-To points at the exact Message-ID we parsed (never empty,
+       never synthetic).
+    """
+    # --- 1) Normalize the subject exactly once -----------------------------
+    base_subject = re.sub(
+        r"^\s*((re|fwd?|fw)\s*:\s*)+", "", original.subject or "", flags=re.IGNORECASE
+    )
+    subject = f"Re: {base_subject}" if base_subject else "Re:"
+
+    msg = MIMEText(reply_body, _charset="utf-8")
+    msg["From"] = from_addr
+    msg["To"] = original.from_addr
+    msg["Subject"] = subject
+
+    # --- 2/3) Threading headers --------------------------------------------
+    orig_id = (original.message_id or "").strip()
+    if orig_id and not orig_id.startswith("synthetic:"):
+        parent_refs = (original.raw_headers.get("References") or "").strip()
+        refs_parts = [p for p in parent_refs.split() if p.startswith("<")]
+        if orig_id not in refs_parts:
+            refs_parts.append(orig_id)
+        msg["In-Reply-To"] = orig_id
+        msg["References"] = " ".join(refs_parts)
+
+        # Optional extras some clients use in addition to the standard ones.
+        thread_topic = (original.raw_headers.get("Thread-Topic") or "").strip()
+        if thread_topic:
+            msg["Thread-Topic"] = thread_topic
+        thread_index = (original.raw_headers.get("Thread-Index") or "").strip()
+        if thread_index:
+            # Extend the parent's index rather than copy it verbatim.
+            msg["Thread-Index"] = thread_index + "AA=="
+
+    # Loop protection on our own replies.
+    msg["Auto-Submitted"] = "auto-replied"
+    return msg
+
+
+async def send_reply(settings: Settings, msg: Message) -> None:
+    """Send ``msg`` over SMTP using the configured TLS mode.
+
+    aiosmtplib semantics (easy to get wrong):
+    - ``use_tls=True``   -> implicit TLS from the first byte (SMTPS, port 465)
+    - ``start_tls=True`` -> upgrade an existing plain connection (port 587)
+
+    Previously this mapped "ssl" -> use_tls and *everything else* ->
+    start_tls, so a misconfigured/empty SMTP_SECURITY silently forced
+    STARTTLS against an SSL-only port (and vice versa), making sends hang
+    or fail. Now the mode is explicit and defaults to starttls.
+    """
+    security = getattr(settings.smtp_security, "value", str(settings.smtp_security))
+    kwargs: dict[str, Any] = {
+        "hostname": settings.smtp_host,
+        "port": settings.smtp_port,
+        "username": settings.smtp_user,
+        "password": settings.smtp_password,
+        "timeout": 30,
+    }
+    if security == "ssl":
+        kwargs["use_tls"] = True
+    elif security == "starttls":
+        kwargs["start_tls"] = True
+    else:  # pragma: no cover - enum should prevent this
+        raise ValueError(f"unknown SMTP_SECURITY: {security!r}")
+    await aiosmtplib.send(msg, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# In-memory fake mail source (used by tests and `replay` CLI)
+# ---------------------------------------------------------------------------
+
+class FakeMailSource:
+    """Async iterator yielding parsed :class:`EmailMessage` objects from a
+    pre-populated list. Used by tests and the `replay` CLI command."""
+
+    def __init__(self, items: Iterable[EmailMessage]):
+        self._items = list(items)
+
+    def __aiter__(self):
+        self._idx = 0
+        return self
+
+    async def __anext__(self) -> EmailMessage:
+        if self._idx >= len(self._items):
+            raise StopAsyncIteration
+        item = self._items[self._idx]
+        self._idx += 1
+        return item
+
+
+__all__ = [
+    "parse_email_bytes",
+    "fetch_unseen",
+    "mark_seen",
+    "append_draft",
+    "build_reply_message",
+    "send_reply",
+    "FakeMailSource",
+]
